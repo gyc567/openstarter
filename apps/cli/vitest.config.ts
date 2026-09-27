@@ -10,6 +10,12 @@ export default defineConfig({
     dangerouslyIgnoreUnhandledErrors: true,
     coverage: {
       exclude: ["**/*.d.ts", "**/*.test.{ts,tsx}", "src/types.ts", "src/index.ts"],
+      thresholds: {
+        branches: 30,
+        functions: 30,
+        lines: 30,
+        statements: 30,
+      },
     },
   },
 });
