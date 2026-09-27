@@ -4,11 +4,20 @@
 import Taro from "@tarojs/taro";
 import { getToken } from "@/utils/storage";
 
-// 小程序环境无 DOM 类型，Reducer 入参使用含 any 的宽松签名（运行时校验）。
+// 入参签名使用窄类型联合而非 any；运行时由 normalizeHeaders() 兼容 Web Headers。
 // 见 normalizeHeaders() 和 parseBody() 内 typeof 检查。
 
+/** 适配 fetch HeadersInit 的窄类型联合（小程序可能无原生 Headers 实例）。 */
+export type HeadersLike =
+  | Record<string, string>
+  | Array<[string, string]>
+  | { entries(): Iterable<[string, string]> };
+
+/** fetch 入参窄类型：字符串、URL 实例，或 Request-style `{ url }` 对象。 */
+export type FetchInput = string | URL | { url: string };
+
 /** 极简 Response shim（小程序环境无原生 Response API）。 */
-export class MiniResponse {
+export class MiniResponse implements Pick<Response, "status" | "ok" | "json"> {
   status: number;
   ok: boolean;
   headers: { get(name: string): string | null };
@@ -33,9 +42,12 @@ export class MiniResponse {
 
 /** 把 Taro.request 包装成标准 fetch 接口（FetchEsque）。 */
 export function createTaroFetch(onUnauthorized?: () => void) {
-  return async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+  return async (
+    input: FetchInput,
+    init?: Omit<RequestInit, "headers" | "body"> & { headers?: HeadersLike; body?: unknown },
+  ): Promise<Response> => {
     const url =
-      typeof input === "string" ? input : input instanceof URL ? input.href : (input as any).url;
+      typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     const token = getToken();
     const headers = normalizeHeaders(init?.headers);
 
@@ -47,7 +59,7 @@ export function createTaroFetch(onUnauthorized?: () => void) {
 
     const res = await Taro.request({
       url,
-      method: (init?.method || "GET") as any,
+      method: (init?.method ?? "GET") as keyof Taro.request.Method,
       header: headers,
       data: body,
     });
@@ -56,37 +68,33 @@ export function createTaroFetch(onUnauthorized?: () => void) {
       onUnauthorized?.();
     }
 
-    return new MiniResponse(res.data, res.statusCode, res.header || {}) as any as Response;
+    return new MiniResponse(res.data, res.statusCode, res.header || {}) as unknown as Response;
   };
 }
 
-function normalizeHeaders(
-  headers?:
-    | Record<string, string>
-    | Array<[string, string]>
-    | { entries(): Iterable<[string, string]> },
-): Record<string, string> {
+export function normalizeHeaders(headers?: HeadersLike): Record<string, string> {
   if (!headers) return {};
 
+  // Handle array of tuples (must precede entries() check since arrays also have entries())
+  if (Array.isArray(headers)) {
+    return Object.fromEntries(headers);
+  }
+
   // Handle Headers instance (Web API, 小程序可能无此类型)
-  if (typeof (headers as any).entries === "function") {
+  if (typeof (headers as Partial<HeadersLike>).entries === "function") {
     try {
-      return Object.fromEntries((headers as any).entries());
+      const entries = (headers as { entries(): Iterable<[string, string]> }).entries();
+      return Object.fromEntries(entries);
     } catch {
       /* ignore */
     }
-  }
-
-  // Handle array of tuples
-  if (Array.isArray(headers)) {
-    return Object.fromEntries(headers);
   }
 
   // Handle plain object
   return headers as Record<string, string>;
 }
 
-function parseBody(body: unknown): unknown {
+export function parseBody(body: unknown): unknown {
   if (!body) return undefined;
 
   if (typeof body === "string") {

@@ -8,7 +8,22 @@ export default defineConfig({
     },
   },
   test: {
-    include: ["test/**/*.test.{ts,tsx}"],
+    include: ["src/**/*.test.{ts,tsx}"],
     environment: "node",
+    coverage: {
+      exclude: [
+        "**/*.d.ts",
+        "**/*.test.{ts,tsx}",
+        "src/app.config.ts",
+        "src/app.tsx",
+        "src/app.scss",
+        "src/styles.d.ts",
+        "src/pages/**",
+        "src/components/**",
+        "src/hooks/use-auth.ts",
+        "src/services/client.ts",
+        "src/lib/auth-client.ts",
+      ],
+    },
   },
 });
