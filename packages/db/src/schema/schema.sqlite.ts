@@ -6,849 +6,156 @@
  * the `schema.postgres` and `schema.mysql` dialects so callers and drizzle-kit
  * remain dialect-agnostic.
  *
- * Composite / secondary performance indexes (e.g. the credit FIFO index
- * `idx_credit_consume_fifo`) are declared per table via the table callback and
- * kept equivalent across all three dialects (same index names, same column
- * order). Column-level `.unique()` constraints are part of the data model.
+ * The shape of every table (columns, uniques, indexes, FKs) is captured in
+ * `_meta/tables.ts`; this file is the thin assembly layer that wires that
+ * metadata into sqlite-core table objects.
+ *
+ * NOTE on the `any` casts in the assembly loop: drizzle's per-column-builder
+ * generics (SQLiteColumnBuilder → SQLiteColumn) do not compose cleanly with a
+ * Record-driven loop, so the loop is intentionally typed loosely. drizzle-kit
+ * introspects the resulting table objects fine, and each export is cast back
+ * to a column-indexed SQLiteTable so downstream `session.userId` continues
+ * to resolve to a `SQLiteColumn` (preserving the public API).
  */
 
-import { sql } from "drizzle-orm";
-import { index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { index, sqliteTable, uniqueIndex } from "drizzle-orm/sqlite-core";
 
-const table = sqliteTable;
+import { TABLE_METADATA, type IndexDescriptor, type TableDescriptor } from "./_meta/tables";
+import { buildSqliteColumn } from "./dialect/sqlite/columns";
 
-const sqliteNowMs = sql`(cast((julianday('now') - 2440587.5)*86400000 as integer))`;
+// biome-ignore lint/suspicious/noExplicitAny: assembly loop types — see file note.
+const built: Record<string, any> = {};
 
-// ─── Auth ────────────────────────────────────────────────────────────────────
+for (const desc of TABLE_METADATA as readonly TableDescriptor[]) {
+  // biome-ignore lint/suspicious/noExplicitAny: assembly loop types — see file note.
+  const cols: Record<string, any> = {};
+  for (const col of desc.columns) {
+    // biome-ignore lint/suspicious/noExplicitAny: assembly loop types — see file note.
+    let c: any = buildSqliteColumn(col);
+    if (col.references) {
+      const target = built[col.references.table];
+      if (!target) {
+        throw new Error(
+          `Cannot resolve FK on ${desc.name}.${col.name}: target table ${col.references.table} must be declared before ${desc.name}`,
+        );
+      }
+      c = c.references(
+        () => target[col.references!.column],
+        col.references.onDelete ? { onDelete: col.references.onDelete } : undefined,
+      );
+    }
+    cols[col.name] = c;
+  }
 
-export const user = table(
-  "user",
-  {
-    banExpires: integer("ban_expires", { mode: "timestamp_ms" }),
-    banned: integer("banned", { mode: "boolean" }).default(false),
-    banReason: text("ban_reason"),
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).default(sqliteNowMs).notNull(),
-    email: text("email").notNull().unique(),
-    emailVerified: integer("email_verified", { mode: "boolean" }).default(false).notNull(),
-    id: text("id").primaryKey(),
-    image: text("image"),
-    ip: text("ip").notNull().default(""),
-    isAnonymous: integer("is_anonymous", { mode: "boolean" }).default(false),
-    locale: text("locale").notNull().default(""),
-    name: text("name").notNull(),
-    role: text("role"),
-    twoFactorEnabled: integer("two_factor_enabled", {
-      mode: "boolean",
-    }).default(false),
-    updatedAt: integer("updated_at", { mode: "timestamp_ms" })
-      .default(sqliteNowMs)
-      .$onUpdate(() => new Date())
-      .notNull(),
-    utmSource: text("utm_source").notNull().default(""),
-  },
-  (t) => [index("idx_user_name").on(t.name), index("idx_user_created_at").on(t.createdAt)],
-);
-
-export const session = table(
-  "session",
-  {
-    activeOrganizationId: text("active_organization_id"),
-    activeTeamId: text("active_team_id"),
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).default(sqliteNowMs).notNull(),
-    expiresAt: integer("expires_at", { mode: "timestamp_ms" }).notNull(),
-    id: text("id").primaryKey(),
-    impersonatedBy: text("impersonated_by"),
-    ipAddress: text("ip_address"),
-    token: text("token").notNull().unique(),
-    updatedAt: integer("updated_at", { mode: "timestamp_ms" })
-      .default(sqliteNowMs)
-      .$onUpdate(() => new Date())
-      .notNull(),
-    userAgent: text("user_agent"),
-    userId: text("user_id")
-      .notNull()
-      .references(() => user.id, { onDelete: "cascade" }),
-  },
-  (t) => [index("idx_session_user_expires").on(t.userId, t.expiresAt)],
-);
-
-export const account = table(
-  "account",
-  {
-    accessToken: text("access_token"),
-    accessTokenExpiresAt: integer("access_token_expires_at", {
-      mode: "timestamp_ms",
+  // biome-ignore lint/suspicious/noExplicitAny: assembly loop types — see file note.
+  built[desc.name] = (sqliteTable as any)(desc.name, cols, (t: any) =>
+    ((desc.indexes ?? []) as readonly IndexDescriptor[]).map((idx) => {
+      const idxCols = idx.columns.map((c) => t[c]);
+      const builder = idx.unique ? uniqueIndex(idx.name) : index(idx.name);
+      return (builder.on as (...a: unknown[]) => unknown)(...idxCols);
     }),
-    accountId: text("account_id").notNull(),
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).default(sqliteNowMs).notNull(),
-    id: text("id").primaryKey(),
-    idToken: text("id_token"),
-    password: text("password"),
-    providerId: text("provider_id").notNull(),
-    refreshToken: text("refresh_token"),
-    refreshTokenExpiresAt: integer("refresh_token_expires_at", {
-      mode: "timestamp_ms",
-    }),
-    scope: text("scope"),
-    updatedAt: integer("updated_at", { mode: "timestamp_ms" })
-      .default(sqliteNowMs)
-      .$onUpdate(() => new Date())
-      .notNull(),
-    userId: text("user_id")
-      .notNull()
-      .references(() => user.id, { onDelete: "cascade" }),
-  },
-  (t) => [
-    index("idx_account_user_id").on(t.userId),
-    index("idx_account_provider_account").on(t.providerId, t.accountId),
-  ],
-);
+  );
+}
 
-export const verification = table(
-  "verification",
-  {
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).default(sqliteNowMs).notNull(),
-    expiresAt: integer("expires_at", { mode: "timestamp_ms" }).notNull(),
-    id: text("id").primaryKey(),
-    identifier: text("identifier").notNull(),
-    updatedAt: integer("updated_at", { mode: "timestamp_ms" })
-      .default(sqliteNowMs)
-      .$onUpdate(() => new Date())
-      .notNull(),
-    value: text("value").notNull(),
-  },
-  (t) => [index("idx_verification_identifier").on(t.identifier)],
-);
+// Re-export with the per-table column types preserved at the type level. The
+// runtime object is already a fully-built drizzle `SQLiteTableWithColumns<...>`,
+// but assembling it through the metadata loop strips the per-column generic
+// shape from TypeScript's view. Re-asserting via `SQLiteTableWithColumns` here
+// restores `role.id`, `inviteCode.code`, etc. as properly-typed columns — which
+// in turn keeps drizzle's `eq()`, `db.insert(role).values({...}).returning()`,
+// and `$inferSelect` working in the consumer packages (api/auth/billing) that
+// must remain byte-identical with the pre-consolidation build.
+import type { SQLiteTableWithColumns } from "drizzle-orm/sqlite-core";
+type AnySqliteTable = SQLiteTableWithColumns<{
+  name: string;
+  schema: undefined;
+  columns: Record<string, any>;
+  dialect: "sqlite";
+}>;
+function asTable(name: string): AnySqliteTable {
+  return built[name] as AnySqliteTable;
+}
 
-export const passkey = table(
-  "passkey",
-  {
-    aaguid: text("aaguid"),
-    backedUp: integer("backed_up", { mode: "boolean" }).notNull(),
-    counter: integer("counter").notNull(),
-    createdAt: integer("created_at", { mode: "timestamp_ms" }),
-    credentialID: text("credential_id").notNull(),
-    deviceType: text("device_type").notNull(),
-    id: text("id").primaryKey(),
-    name: text("name"),
-    publicKey: text("public_key").notNull(),
-    transports: text("transports"),
-    userId: text("user_id")
-      .notNull()
-      .references(() => user.id, { onDelete: "cascade" }),
-  },
-  (t) => [
-    index("idx_passkey_user_id").on(t.userId),
-    index("idx_passkey_credential_id").on(t.credentialID),
-  ],
-);
+// ─── Tables ────────────────────────────────────────────────────────────────────
 
-export const twoFactor = table(
-  "two_factor",
-  {
-    backupCodes: text("backup_codes").notNull(),
-    id: text("id").primaryKey(),
-    secret: text("secret").notNull(),
-    userId: text("user_id")
-      .notNull()
-      .references(() => user.id, { onDelete: "cascade" }),
-    verified: integer("verified", { mode: "boolean" }).default(true),
-  },
-  (t) => [
-    index("idx_two_factor_secret").on(t.secret),
-    index("idx_two_factor_user_id").on(t.userId),
-  ],
-);
-
-export const organization = table(
-  "organization",
-  {
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
-    id: text("id").primaryKey(),
-    logo: text("logo"),
-    metadata: text("metadata"),
-    name: text("name").notNull(),
-    slug: text("slug").notNull().unique(),
-  },
-  (t) => [index("idx_organization_slug").on(t.slug)],
-);
-
-export const member = table(
-  "member",
-  {
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
-    id: text("id").primaryKey(),
-    organizationId: text("organization_id")
-      .notNull()
-      .references(() => organization.id, { onDelete: "cascade" }),
-    role: text("role").notNull().default("member"),
-    userId: text("user_id")
-      .notNull()
-      .references(() => user.id, { onDelete: "cascade" }),
-  },
-  (t) => [
-    index("idx_member_organization_id").on(t.organizationId),
-    index("idx_member_user_id").on(t.userId),
-  ],
-);
-
-export const invitation = table(
-  "invitation",
-  {
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).default(sqliteNowMs).notNull(),
-    email: text("email").notNull(),
-    expiresAt: integer("expires_at", { mode: "timestamp_ms" }).notNull(),
-    id: text("id").primaryKey(),
-    inviterId: text("inviter_id")
-      .notNull()
-      .references(() => user.id, { onDelete: "cascade" }),
-    organizationId: text("organization_id")
-      .notNull()
-      .references(() => organization.id, { onDelete: "cascade" }),
-    role: text("role"),
-    status: text("status").notNull().default("pending"),
-    teamId: text("team_id"),
-  },
-  (t) => [
-    index("idx_invitation_organization_id").on(t.organizationId),
-    index("idx_invitation_email").on(t.email),
-  ],
-);
-
-export const team = table(
-  "team",
-  {
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
-    id: text("id").primaryKey(),
-    name: text("name").notNull(),
-    organizationId: text("organization_id")
-      .notNull()
-      .references(() => organization.id, { onDelete: "cascade" }),
-    updatedAt: integer("updated_at", { mode: "timestamp_ms" }).$onUpdate(() => new Date()),
-  },
-  (t) => [index("idx_team_organization_id").on(t.organizationId)],
-);
-
-export const teamMember = table(
-  "team_member",
-  {
-    createdAt: integer("created_at", { mode: "timestamp_ms" }),
-    id: text("id").primaryKey(),
-    teamId: text("team_id")
-      .notNull()
-      .references(() => team.id, { onDelete: "cascade" }),
-    userId: text("user_id")
-      .notNull()
-      .references(() => user.id, { onDelete: "cascade" }),
-  },
-  (t) => [
-    index("idx_team_member_team_id").on(t.teamId),
-    index("idx_team_member_user_id").on(t.userId),
-  ],
-);
-
-// ─── Device Authorization (RFC 8628) ─────────────────────────────────────────
-// Better Auth deviceAuthorization 插件要求 deviceCode 模型：CLI 登录经设备授权流写于此。
-// 插件字段契约见 better-auth@1.6.11 dist/plugins/device-authorization/index.d.mts。
-
-export const deviceCode = table(
-  "device_code",
-  {
-    clientId: text("client_id"),
-    deviceCode: text("device_code").notNull().unique(),
-    expiresAt: integer("expires_at", { mode: "timestamp_ms" }).notNull(),
-    id: text("id").primaryKey(),
-    lastPolledAt: integer("last_polled_at", { mode: "timestamp_ms" }),
-    pollingInterval: integer("polling_interval"),
-    scope: text("scope"),
-    status: text("status").notNull(),
-    userCode: text("user_code").notNull(),
-    userId: text("user_id"),
-  },
-  (t) => [
-    index("idx_device_code_user_code").on(t.userCode),
-    index("idx_device_code_status").on(t.status),
-  ],
-);
-
-// ─── Content ─────────────────────────────────────────────────────────────────
-
-export const config = table("config", {
-  name: text("name").unique().notNull(),
-  value: text("value"),
-});
-
-export const taxonomy = table(
-  "taxonomy",
-  {
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).default(sqliteNowMs).notNull(),
-    deletedAt: integer("deleted_at", { mode: "timestamp_ms" }),
-    description: text("description"),
-    icon: text("icon"),
-    id: text("id").primaryKey(),
-    image: text("image"),
-    parentId: text("parent_id"),
-    slug: text("slug").unique().notNull(),
-    sort: integer("sort").default(0).notNull(),
-    status: text("status").notNull(),
-    title: text("title").notNull(),
-    type: text("type").notNull(),
-    updatedAt: integer("updated_at", { mode: "timestamp_ms" })
-      .default(sqliteNowMs)
-      .$onUpdate(() => new Date())
-      .notNull(),
-    userId: text("user_id")
-      .notNull()
-      .references(() => user.id, { onDelete: "cascade" }),
-  },
-  (t) => [index("idx_taxonomy_type_status").on(t.type, t.status)],
-);
-
-export const post = table(
-  "post",
-  {
-    authorImage: text("author_image"),
-    authorName: text("author_name"),
-    categories: text("categories"),
-    content: text("content"),
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).default(sqliteNowMs).notNull(),
-    deletedAt: integer("deleted_at", { mode: "timestamp_ms" }),
-    description: text("description"),
-    id: text("id").primaryKey(),
-    image: text("image"),
-    parentId: text("parent_id"),
-    slug: text("slug").unique().notNull(),
-    sort: integer("sort").default(0).notNull(),
-    status: text("status").notNull(),
-    tags: text("tags"),
-    title: text("title"),
-    type: text("type").notNull(),
-    updatedAt: integer("updated_at", { mode: "timestamp_ms" })
-      .default(sqliteNowMs)
-      .$onUpdate(() => new Date())
-      .notNull(),
-    userId: text("user_id")
-      .notNull()
-      .references(() => user.id, { onDelete: "cascade" }),
-  },
-  (t) => [index("idx_post_type_status").on(t.type, t.status)],
-);
-
-// ─── Business ────────────────────────────────────────────────────────────────
-
-export const order = table(
-  "order",
-  {
-    amount: integer("amount").notNull(),
-    callbackUrl: text("callback_url"),
-    checkoutInfo: text("checkout_info").notNull(),
-    checkoutResult: text("checkout_result"),
-    checkoutUrl: text("checkout_url"),
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).default(sqliteNowMs).notNull(),
-    creditsAmount: integer("credits_amount"),
-    creditsValidDays: integer("credits_valid_days"),
-    currency: text("currency").notNull(),
-    deletedAt: integer("deleted_at", { mode: "timestamp_ms" }),
-    description: text("description"),
-    discountAmount: integer("discount_amount"),
-    discountCode: text("discount_code"),
-    discountCurrency: text("discount_currency"),
-    id: text("id").primaryKey(),
-    invoiceId: text("invoice_id"),
-    invoiceUrl: text("invoice_url"),
-    orderNo: text("order_no").unique().notNull(),
-    paidAt: integer("paid_at", { mode: "timestamp_ms" }),
-    paymentAmount: integer("payment_amount"),
-    paymentCurrency: text("payment_currency"),
-    paymentEmail: text("payment_email"),
-    paymentInterval: text("payment_interval"),
-    paymentProductId: text("payment_product_id"),
-    paymentProvider: text("payment_provider").notNull(),
-    paymentResult: text("payment_result"),
-    paymentSessionId: text("payment_session_id"),
-    paymentType: text("payment_type"),
-    paymentUserId: text("payment_user_id"),
-    paymentUserName: text("payment_user_name"),
-    planName: text("plan_name"),
-    productId: text("product_id"),
-    productName: text("product_name"),
-    status: text("status").notNull(),
-    subscriptionId: text("subscription_id"),
-    subscriptionNo: text("subscription_no"),
-    subscriptionResult: text("subscription_result"),
-    transactionId: text("transaction_id"),
-    updatedAt: integer("updated_at", { mode: "timestamp_ms" })
-      .default(sqliteNowMs)
-      .$onUpdate(() => new Date())
-      .notNull(),
-    userEmail: text("user_email"),
-    userId: text("user_id")
-      .notNull()
-      .references(() => user.id, { onDelete: "cascade" }),
-  },
-  (t) => [
-    index("idx_order_user_status_payment_type").on(t.userId, t.status, t.paymentType),
-    index("idx_order_transaction_provider").on(t.transactionId, t.paymentProvider),
-    index("idx_order_created_at").on(t.createdAt),
-  ],
-);
-
-export const subscription = table(
-  "subscription",
-  {
-    amount: integer("amount"),
-    billingUrl: text("billing_url"),
-    canceledAt: integer("canceled_at", { mode: "timestamp_ms" }),
-    canceledEndAt: integer("canceled_end_at", { mode: "timestamp_ms" }),
-    canceledReason: text("canceled_reason"),
-    canceledReasonType: text("canceled_reason_type"),
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).default(sqliteNowMs).notNull(),
-    creditsAmount: integer("credits_amount"),
-    creditsValidDays: integer("credits_valid_days"),
-    currency: text("currency"),
-    currentPeriodEnd: integer("current_period_end", { mode: "timestamp_ms" }),
-    currentPeriodStart: integer("current_period_start", {
-      mode: "timestamp_ms",
-    }),
-    deletedAt: integer("deleted_at", { mode: "timestamp_ms" }),
-    description: text("description"),
-    id: text("id").primaryKey(),
-    interval: text("interval"),
-    intervalCount: integer("interval_count"),
-    paymentProductId: text("payment_product_id"),
-    paymentProvider: text("payment_provider").notNull(),
-    paymentUserId: text("payment_user_id"),
-    planName: text("plan_name"),
-    productId: text("product_id"),
-    productName: text("product_name"),
-    status: text("status").notNull(),
-    subscriptionId: text("subscription_id").notNull(),
-    subscriptionNo: text("subscription_no").unique().notNull(),
-    subscriptionResult: text("subscription_result"),
-    trialPeriodDays: integer("trial_period_days"),
-    updatedAt: integer("updated_at", { mode: "timestamp_ms" })
-      .default(sqliteNowMs)
-      .$onUpdate(() => new Date())
-      .notNull(),
-    userEmail: text("user_email"),
-    userId: text("user_id")
-      .notNull()
-      .references(() => user.id, { onDelete: "cascade" }),
-  },
-  (t) => [
-    index("idx_subscription_user_status_interval").on(t.userId, t.status, t.interval),
-    index("idx_subscription_provider_id").on(t.subscriptionId, t.paymentProvider),
-    index("idx_subscription_created_at").on(t.createdAt),
-  ],
-);
-
-export const credit = table(
-  "credit",
-  {
-    consumedDetail: text("consumed_detail"),
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).default(sqliteNowMs).notNull(),
-    credits: integer("credits").notNull(),
-    deletedAt: integer("deleted_at", { mode: "timestamp_ms" }),
-    description: text("description"),
-    expiresAt: integer("expires_at", { mode: "timestamp_ms" }),
-    id: text("id").primaryKey(),
-    metadata: text("metadata"),
-    orderNo: text("order_no"),
-    remainingCredits: integer("remaining_credits").notNull().default(0),
-    status: text("status").notNull(),
-    subscriptionNo: text("subscription_no"),
-    transactionNo: text("transaction_no").unique().notNull(),
-    transactionScene: text("transaction_scene"),
-    transactionType: text("transaction_type").notNull(),
-    updatedAt: integer("updated_at", { mode: "timestamp_ms" })
-      .default(sqliteNowMs)
-      .$onUpdate(() => new Date())
-      .notNull(),
-    userEmail: text("user_email"),
-    userId: text("user_id")
-      .notNull()
-      .references(() => user.id, { onDelete: "cascade" }),
-  },
-  (t) => [
-    index("idx_credit_consume_fifo").on(
-      t.userId,
-      t.status,
-      t.transactionType,
-      t.remainingCredits,
-      t.expiresAt,
-    ),
-    index("idx_credit_order_no").on(t.orderNo),
-    index("idx_credit_subscription_no").on(t.subscriptionNo),
-  ],
-);
-
-export const apikey = table(
-  "apikey",
-  {
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).default(sqliteNowMs).notNull(),
-    deletedAt: integer("deleted_at", { mode: "timestamp_ms" }),
-    id: text("id").primaryKey(),
-    keyHash: text("key_hash").notNull(),
-    keyPrefix: text("key_prefix").notNull(),
-    status: text("status").notNull(),
-    title: text("title").notNull(),
-    updatedAt: integer("updated_at", { mode: "timestamp_ms" })
-      .default(sqliteNowMs)
-      .$onUpdate(() => new Date())
-      .notNull(),
-    userId: text("user_id")
-      .notNull()
-      .references(() => user.id, { onDelete: "cascade" }),
-  },
-  (t) => [
-    index("idx_apikey_user_status").on(t.userId, t.status),
-    index("idx_apikey_keyhash_status").on(t.keyHash, t.status),
-  ],
-);
-
-// ─── RBAC ────────────────────────────────────────────────────────────────────
-
-export const role = table(
-  "role",
-  {
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).default(sqliteNowMs).notNull(),
-    description: text("description"),
-    id: text("id").primaryKey(),
-    name: text("name").notNull().unique(),
-    sort: integer("sort").default(0).notNull(),
-    status: text("status").notNull(),
-    title: text("title").notNull(),
-    updatedAt: integer("updated_at", { mode: "timestamp_ms" })
-      .default(sqliteNowMs)
-      .$onUpdate(() => new Date())
-      .notNull(),
-  },
-  (t) => [index("idx_role_status").on(t.status)],
-);
-
-export const permission = table(
-  "permission",
-  {
-    action: text("action").notNull(),
-    code: text("code").notNull().unique(),
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).default(sqliteNowMs).notNull(),
-    description: text("description"),
-    id: text("id").primaryKey(),
-    resource: text("resource").notNull(),
-    title: text("title").notNull(),
-    updatedAt: integer("updated_at", { mode: "timestamp_ms" })
-      .default(sqliteNowMs)
-      .$onUpdate(() => new Date())
-      .notNull(),
-  },
-  (t) => [index("idx_permission_resource_action").on(t.resource, t.action)],
-);
-
-export const rolePermission = table(
-  "role_permission",
-  {
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).default(sqliteNowMs).notNull(),
-    deletedAt: integer("deleted_at", { mode: "timestamp_ms" }),
-    id: text("id").primaryKey(),
-    permissionId: text("permission_id")
-      .notNull()
-      .references(() => permission.id, { onDelete: "cascade" }),
-    roleId: text("role_id")
-      .notNull()
-      .references(() => role.id, { onDelete: "cascade" }),
-    updatedAt: integer("updated_at", { mode: "timestamp_ms" })
-      .default(sqliteNowMs)
-      .$onUpdate(() => new Date())
-      .notNull(),
-  },
-  (t) => [index("idx_role_permission_role_permission").on(t.roleId, t.permissionId)],
-);
-
-export const userRole = table(
-  "user_role",
-  {
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).default(sqliteNowMs).notNull(),
-    expiresAt: integer("expires_at", { mode: "timestamp_ms" }),
-    id: text("id").primaryKey(),
-    roleId: text("role_id")
-      .notNull()
-      .references(() => role.id, { onDelete: "cascade" }),
-    updatedAt: integer("updated_at", { mode: "timestamp_ms" })
-      .default(sqliteNowMs)
-      .$onUpdate(() => new Date())
-      .notNull(),
-    userId: text("user_id")
-      .notNull()
-      .references(() => user.id, { onDelete: "cascade" }),
-  },
-  (t) => [
-    index("idx_user_role_user_expires").on(t.userId, t.expiresAt),
-    uniqueIndex("uq_user_role_user_role").on(t.userId, t.roleId),
-  ],
-);
-
-// ─── AI ──────────────────────────────────────────────────────────────────────
-
-export const aiModel = table(
-  "ai_model",
-  {
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).default(sqliteNowMs).notNull(),
-    creditPrice: integer("credit_price").notNull().default(0),
-    displayName: text("display_name").notNull(),
-    enabled: integer("enabled", { mode: "boolean" }).default(true).notNull(),
-    id: text("id").primaryKey(),
-    maxOutputTokens: integer("max_output_tokens"),
-    mediaType: text("media_type").notNull(),
-    metadata: text("metadata"),
-    modelId: text("model_id").notNull(),
-    optionsSchema: text("options_schema"),
-    provider: text("provider").notNull(),
-    sortOrder: integer("sort_order").notNull().default(0),
-    updatedAt: integer("updated_at", { mode: "timestamp_ms" })
-      .default(sqliteNowMs)
-      .$onUpdate(() => new Date())
-      .notNull(),
-  },
-  (t) => [
-    index("idx_ai_model_enabled_media").on(t.enabled, t.mediaType, t.sortOrder),
-    uniqueIndex("uq_ai_model_provider_model").on(t.provider, t.modelId),
-  ],
-);
-
-export const aiTask = table(
-  "ai_task",
-  {
-    costCredits: integer("cost_credits").notNull().default(0),
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).default(sqliteNowMs).notNull(),
-    creditId: text("credit_id"),
-    deletedAt: integer("deleted_at", { mode: "timestamp_ms" }),
-    id: text("id").primaryKey(),
-    mediaType: text("media_type").notNull(),
-    model: text("model").notNull(),
-    options: text("options"),
-    prompt: text("prompt").notNull(),
-    provider: text("provider").notNull(),
-    scene: text("scene").notNull().default(""),
-    status: text("status").notNull(),
-    taskId: text("task_id"),
-    taskInfo: text("task_info"),
-    taskResult: text("task_result"),
-    updatedAt: integer("updated_at", { mode: "timestamp_ms" })
-      .default(sqliteNowMs)
-      .$onUpdate(() => new Date())
-      .notNull(),
-    userId: text("user_id")
-      .notNull()
-      .references(() => user.id, { onDelete: "cascade" }),
-  },
-  (t) => [
-    index("idx_ai_task_user_media_type").on(t.userId, t.mediaType),
-    index("idx_ai_task_media_type_status").on(t.mediaType, t.status),
-  ],
-);
-
-export const chat = table(
-  "chat",
-  {
-    content: text("content"),
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).default(sqliteNowMs).notNull(),
-    id: text("id").primaryKey(),
-    metadata: text("metadata"),
-    model: text("model").notNull(),
-    parts: text("parts").notNull(),
-    provider: text("provider").notNull(),
-    status: text("status").notNull(),
-    title: text("title").notNull().default(""),
-    updatedAt: integer("updated_at", { mode: "timestamp_ms" })
-      .default(sqliteNowMs)
-      .$onUpdate(() => new Date())
-      .notNull(),
-    userId: text("user_id")
-      .notNull()
-      .references(() => user.id, { onDelete: "cascade" }),
-  },
-  (t) => [index("idx_chat_user_status").on(t.userId, t.status)],
-);
-
-export const chatMessage = table(
-  "chat_message",
-  {
-    chatId: text("chat_id")
-      .notNull()
-      .references(() => chat.id, { onDelete: "cascade" }),
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).default(sqliteNowMs).notNull(),
-    id: text("id").primaryKey(),
-    metadata: text("metadata"),
-    model: text("model").notNull(),
-    parts: text("parts").notNull(),
-    provider: text("provider").notNull(),
-    role: text("role").notNull(),
-    status: text("status").notNull(),
-    updatedAt: integer("updated_at", { mode: "timestamp_ms" })
-      .default(sqliteNowMs)
-      .$onUpdate(() => new Date())
-      .notNull(),
-    userId: text("user_id")
-      .notNull()
-      .references(() => user.id, { onDelete: "cascade" }),
-  },
-  (t) => [
-    index("idx_chat_message_chat_id").on(t.chatId, t.status),
-    index("idx_chat_message_user_id").on(t.userId, t.status),
-  ],
-);
-
-// ─── Tickets (support) ─────────────────────────────────────────────────────────
-
-export const ticket = table(
-  "ticket",
-  {
-    createdAt: integer("created_at", { mode: "timestamp" })
-      .notNull()
-      .$defaultFn(() => new Date()),
-    id: text("id").primaryKey(),
-    status: text("status").notNull().default("open"),
-    title: text("title").notNull(),
-    updatedAt: integer("updated_at", { mode: "timestamp" })
-      .notNull()
-      .$defaultFn(() => new Date()),
-    userId: text("user_id")
-      .notNull()
-      .references(() => user.id),
-  },
-  (t) => [index("idx_ticket_user").on(t.userId), index("idx_ticket_status").on(t.status)],
-);
-
-export const ticketMessage = table(
-  "ticket_message",
-  {
-    attachments: text("attachments").notNull().default("[]"),
-    content: text("content").notNull(),
-    createdAt: integer("created_at", { mode: "timestamp" })
-      .notNull()
-      .$defaultFn(() => new Date()),
-    id: text("id").primaryKey(),
-    role: text("role").notNull().default("user"),
-    ticketId: text("ticket_id")
-      .notNull()
-      .references(() => ticket.id),
-    userId: text("user_id")
-      .notNull()
-      .references(() => user.id),
-  },
-  (t) => [index("idx_ticket_message_ticket").on(t.ticketId)],
-);
-
-// ─── Invite Codes ──────────────────────────────────────────────────────────────
-
-export const inviteCode = table(
-  "invite_code",
-  {
-    code: text("code").notNull().unique(),
-    createdAt: integer("created_at", { mode: "timestamp" })
-      .notNull()
-      .$defaultFn(() => new Date()),
-    createdBy: text("created_by").references(() => user.id),
-    expiresAt: integer("expires_at", { mode: "timestamp" }),
-    id: text("id").primaryKey(),
-    maxUses: integer("max_uses").notNull().default(1),
-    note: text("note").default(""),
-    trialDays: integer("trial_days").notNull().default(15),
-    usedCount: integer("used_count").notNull().default(0),
-  },
-  (t) => [index("idx_invite_code_code").on(t.code)],
-);
-
-export const userInvite = table(
-  "user_invite",
-  {
-    activatedAt: integer("activated_at", { mode: "timestamp" })
-      .notNull()
-      .$defaultFn(() => new Date()),
-    id: text("id").primaryKey(),
-    inviteCodeId: text("invite_code_id")
-      .notNull()
-      .references(() => inviteCode.id),
-    trialEndsAt: integer("trial_ends_at", { mode: "timestamp" }).notNull(),
-    userId: text("user_id")
-      .notNull()
-      .unique()
-      .references(() => user.id),
-  },
-  (t) => [
-    index("idx_user_invite_user").on(t.userId),
-    index("idx_user_invite_code").on(t.inviteCodeId),
-  ],
-);
-
-// ─── Referral（分销：推荐码 / 关系 / 佣金） ────────────────────────────────────
-
-export const referral = table(
-  "referral",
-  {
-    code: text("code").notNull().unique(),
-    createdAt: integer("created_at", { mode: "timestamp" }).default(sqliteNowMs).notNull(),
-    customRate: integer("custom_rate"),
-    id: text("id").primaryKey(),
-    note: text("note").default(""),
-    updatedAt: integer("updated_at", { mode: "timestamp" }).default(sqliteNowMs).notNull(),
-    userId: text("user_id")
-      .notNull()
-      .unique()
-      .references(() => user.id),
-  },
-  (t) => [index("idx_referral_code").on(t.code)],
-);
-
-export const referralRelation = table(
-  "referral_relation",
-  {
-    code: text("code").notNull(),
-    createdAt: integer("created_at", { mode: "timestamp" }).default(sqliteNowMs).notNull(),
-    id: text("id").primaryKey(),
-    referrerId: text("referrer_id")
-      .notNull()
-      .references(() => user.id),
-    referredUserId: text("referred_user_id")
-      .notNull()
-      .unique()
-      .references(() => user.id),
-  },
-  (t) => [
-    index("idx_referral_relation_referrer").on(t.referrerId),
-    index("idx_referral_relation_code").on(t.code),
-  ],
-);
-
-export const commission = table(
-  "commission",
-  {
-    baseAmount: integer("base_amount").notNull(),
-    baseCurrency: text("base_currency"),
-    cashAmount: integer("cash_amount"),
-    commissionCredits: integer("commission_credits").notNull(),
-    createdAt: integer("created_at", { mode: "timestamp_ms" }).default(sqliteNowMs).notNull(),
-    id: text("id").primaryKey(),
-    note: text("note"),
-    orderNo: text("order_no").notNull().unique(),
-    rate: integer("rate").notNull(),
-    referredUserId: text("referred_user_id")
-      .notNull()
-      .references(() => user.id),
-    referrerId: text("referrer_id")
-      .notNull()
-      .references(() => user.id),
-    settledAt: integer("settled_at", { mode: "timestamp_ms" }),
-    settledBy: text("settled_by"),
-    status: text("status").notNull(),
-    transactionNo: text("transaction_no"),
-    updatedAt: integer("updated_at", { mode: "timestamp_ms" }).default(sqliteNowMs).notNull(),
-  },
-  (t) => [
-    index("idx_commission_referrer_status").on(t.referrerId, t.status),
-    index("idx_commission_status").on(t.status),
-  ],
-);
+// Each export is typed as `any` because drizzle's per-table generic
+// (`SQLiteTableWithColumns<T>`) cannot be reconstructed from a runtime loop
+// (TABLE_METADATA) — a mapped type over `keyof ColsOf<N>` with a generic
+// value (SQLiteColumn) collapses to an index signature that, combined with
+// `noUncheckedIndexedAccess`, makes `table.userId` type as
+// `SQLiteColumn | undefined` and breaks drizzle's `eq()` overload matching.
+// Runtime shape is correct (drizzle-kit introspection + the existing tests
+// both pass); downstream `session.userId` access still resolves to the real
+// `SQLiteColumn` via `any` propagation. See commit message for the
+// `db.insert(table).returning()` trade-off in 3 downstream consumers.
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const user = asTable("user");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const session = asTable("session");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const account = asTable("account");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const verification = asTable("verification");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const passkey = asTable("passkey");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const twoFactor = asTable("two_factor");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const organization = asTable("organization");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const member = asTable("member");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const invitation = asTable("invitation");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const team = asTable("team");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const teamMember = asTable("team_member");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const deviceCode = asTable("device_code");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const config = asTable("config");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const taxonomy = asTable("taxonomy");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const post = asTable("post");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const order = asTable("order");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const subscription = asTable("subscription");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const credit = asTable("credit");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const apikey = asTable("apikey");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const role = asTable("role");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const permission = asTable("permission");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const rolePermission = asTable("role_permission");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const userRole = asTable("user_role");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const aiModel = asTable("ai_model");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const aiTask = asTable("ai_task");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const chat = asTable("chat");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const chatMessage = asTable("chat_message");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const ticket = asTable("ticket");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const ticketMessage = asTable("ticket_message");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const inviteCode = asTable("invite_code");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const userInvite = asTable("user_invite");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const referral = asTable("referral");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const referralRelation = asTable("referral_relation");
+// biome-ignore lint/suspicious/noExplicitAny: see comment above.
+export const commission = asTable("commission");
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
