@@ -15,7 +15,6 @@
     "check-types": "tsr generate && tsc --noEmit"
   },
   "dependencies": {
-    "@ai-sdk/react": "^3.0.281",
     "@better-auth/passkey": "catalog:",
     "@mdx-js/react": "catalog:",
     "@openstarter/ai-web": "workspace:*",
@@ -25,6 +24,8 @@
     "@openstarter/i18n-web": "workspace:*",
     "@openstarter/ui-web": "workspace:*",
     "@tailwindcss/vite": "^4.2.2",
+    "@tanstack/ai": "catalog:",
+    "@tanstack/ai-react": "catalog:",
     "@tanstack/pacer": "^0.22.0",
     "@tanstack/react-form": "^1.28.0",
     "@tanstack/react-query": "^5.99.0",
@@ -34,7 +35,6 @@
     "@tanstack/react-store": "^0.11.1",
     "@tanstack/react-table": "^9.2.4",
     "@tanstack/react-virtual": "^3.14.12",
-    "ai": "catalog:",
     "better-auth": "catalog:",
     "dotenv": "catalog:",
     "hono": "catalog:",

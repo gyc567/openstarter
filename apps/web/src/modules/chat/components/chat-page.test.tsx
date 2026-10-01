@@ -1,9 +1,9 @@
-// ChatPage 组件测试（Task 9）：mock useChat（@ai-sdk/react）与 ai 查询工厂，
+// ChatPage 组件测试（Task 9）：mock useChat（@tanstack/ai-react）与 ai 查询工厂，
 // 覆盖消息渲染/历史加载、模型选择、发送、流式停止、错误态与会话管理。
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 // jsdom 未实现 scrollIntoView；Radix Select 打开时会对选中项调用它。
 beforeAll(() => {
@@ -27,16 +27,21 @@ const useChatState = vi.hoisted(() => ({
     messages: [] as Array<{
       id: string;
       role: "user" | "assistant";
-      parts: Array<{ type: "text"; text: string }>;
+      parts: Array<{ type: "text"; content: string }>;
     }>,
     sendMessage: vi.fn(),
-    status: "ready" as string,
+    isLoading: false,
     error: undefined as Error | undefined,
     setMessages: vi.fn(),
     stop: vi.fn(),
-    clearError: vi.fn(),
     onFinish: undefined as ((event: unknown) => void) | undefined,
+    onError: undefined as ((error: Error) => void) | undefined,
   },
+}));
+
+// fetchServerSentEvents 的第二个参数（FetchConnectionOptions，含 fetchClient）。
+const connectionOptions = vi.hoisted(() => ({
+  current: undefined as Record<string, unknown> | undefined,
 }));
 
 const chatsState = vi.hoisted(() => ({
@@ -57,17 +62,22 @@ const messagesGetMock = vi.hoisted(() => vi.fn());
 
 const toastMocks = vi.hoisted(() => ({ error: vi.fn(), success: vi.fn() }));
 
-vi.mock("@ai-sdk/react", () => ({
-  // 捕获组件传入的 onFinish（useChat options），供流结束失效缓存的断言使用。
-  useChat: (options?: { onFinish?: (event: unknown) => void }) => {
+vi.mock("@tanstack/ai-react", () => ({
+  // 捕获组件传入的 onFinish / onError（useChat options），供流结束失效缓存与
+  // 错误透出的断言使用。
+  useChat: (options?: {
+    onFinish?: (event: unknown) => void;
+    onError?: (error: Error) => void;
+  }) => {
     useChatState.current.onFinish = options?.onFinish;
+    useChatState.current.onError = options?.onError;
     return useChatState.current;
   },
-}));
-
-// DefaultChatTransport 由 `ai` 包导出（@ai-sdk/react 3.x 不转发该导出）。
-vi.mock("ai", () => ({
-  DefaultChatTransport: vi.fn(),
+  // 连接适配器由 hook 消费；组件测试关心端点路径与传入的连接选项（fetchClient）。
+  fetchServerSentEvents: vi.fn((path: string, options?: Record<string, unknown>) => {
+    connectionOptions.current = options;
+    return path;
+  }),
 }));
 
 vi.mock("@/modules/ai/lib/api", () => ({
@@ -168,13 +178,14 @@ beforeEach(() => {
   useChatState.current = {
     messages: [],
     sendMessage: vi.fn(),
-    status: "ready",
+    isLoading: false,
     error: undefined,
     setMessages: vi.fn(),
     stop: vi.fn(),
-    clearError: vi.fn(),
     onFinish: undefined,
+    onError: undefined,
   };
+  connectionOptions.current = undefined;
   chatsState.items = [
     chatRow({ id: "chat-1", title: "Trip planning" }),
     chatRow({ id: "chat-2", title: "Refactor ideas" }),
@@ -218,8 +229,8 @@ beforeEach(() => {
 describe("ChatPage", () => {
   it("renders message text of the active conversation", async () => {
     useChatState.current.messages = [
-      { id: "m1", parts: [{ type: "text", text: "Plan a trip to Kyoto" }], role: "user" },
-      { id: "m2", parts: [{ type: "text", text: "Here is a plan." }], role: "assistant" },
+      { id: "m1", parts: [{ content: "Plan a trip to Kyoto", type: "text" }], role: "user" },
+      { id: "m2", parts: [{ content: "Here is a plan.", type: "text" }], role: "assistant" },
     ];
 
     renderChatPage();
@@ -245,10 +256,10 @@ describe("ChatPage", () => {
     });
     await waitFor(() => {
       expect(useChatState.current.setMessages).toHaveBeenCalledWith([
-        { id: "msg-1", parts: [{ type: "text", text: "Plan a trip to Kyoto" }], role: "user" },
+        { id: "msg-1", parts: [{ content: "Plan a trip to Kyoto", type: "text" }], role: "user" },
         {
           id: "msg-2",
-          parts: [{ type: "text", text: "Here is a day-by-day plan." }],
+          parts: [{ content: "Here is a day-by-day plan.", type: "text" }],
           role: "assistant",
         },
       ]);
@@ -296,9 +307,9 @@ describe("ChatPage", () => {
     // 更早的消息拼接在列表最前（pages 新→旧，展平时反转为时间正序）。
     await waitFor(() => {
       expect(useChatState.current.setMessages).toHaveBeenCalledWith([
-        { id: "msg-1", parts: [{ type: "text", text: "oldest" }], role: "user" },
-        { id: "msg-2", parts: [{ type: "text", text: "newer-1" }], role: "user" },
-        { id: "msg-3", parts: [{ type: "text", text: "newer-2" }], role: "assistant" },
+        { id: "msg-1", parts: [{ content: "oldest", type: "text" }], role: "user" },
+        { id: "msg-2", parts: [{ content: "newer-1", type: "text" }], role: "user" },
+        { id: "msg-3", parts: [{ content: "newer-2", type: "text" }], role: "assistant" },
       ]);
     });
   });
@@ -372,12 +383,12 @@ describe("ChatPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
 
     await waitFor(() => {
-      expect(useChatState.current.sendMessage).toHaveBeenCalledWith({ text: "Hello there" });
+      expect(useChatState.current.sendMessage).toHaveBeenCalledWith("Hello there");
     });
   });
 
   it("disables the input and stops the stream while streaming", async () => {
-    useChatState.current = { ...useChatState.current, status: "streaming" };
+    useChatState.current = { ...useChatState.current, isLoading: true };
 
     renderChatPage();
 
@@ -442,7 +453,122 @@ describe("ChatPage", () => {
     expect(await screen.findByRole("alert")).toBeTruthy();
     expect(screen.getByText("boom")).toBeTruthy();
 
+    // useChat 无 clearError：横幅由本地 errorDismissed 状态收起。
     fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
-    expect(useChatState.current.clearError).toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+  });
+
+  it("会话切换重挂载 ChatSurface（key=chatId）：错误横幅的本地收起态被重置", async () => {
+    useChatState.current = { ...useChatState.current, error: new Error("boom") };
+
+    renderChatPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Trip planning" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Dismiss" }));
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+
+    // 无 key 时 ChatSurface 只是重渲染，errorDismissed 会跨会话残留 → 横幅不再出现。
+    fireEvent.click(screen.getByRole("button", { name: "Refactor ideas" }));
+
+    expect(await screen.findByRole("alert")).toBeTruthy();
+    expect(screen.getByText("boom")).toBeTruthy();
+  });
+
+  describe("402/502 响应消息透出（I2）", () => {
+    const renderActiveChat = async () => {
+      renderChatPage();
+      fireEvent.click(await screen.findByRole("button", { name: "Trip planning" }));
+      await waitFor(() => expect(connectionOptions.current).toBeDefined());
+      const fetchClient = connectionOptions.current?.fetchClient;
+      if (typeof fetchClient !== "function") {
+        throw new Error("fetchServerSentEvents 未收到 fetchClient");
+      }
+      return fetchClient as typeof fetch;
+    };
+
+    const stubResponse = (init: {
+      ok: boolean;
+      status: number;
+      statusText?: string;
+      body: string;
+    }) =>
+      ({
+        ok: init.ok,
+        status: init.status,
+        statusText: init.statusText ?? "",
+        clone: () => ({ text: async () => init.body }),
+      }) as unknown as Response;
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it("非 2xx 时抛出响应正文（而非 status 文案）", async () => {
+      const fetchClient = await renderActiveChat();
+      const body = JSON.stringify({ code: 1001, message: "insufficient credits" });
+      vi.stubGlobal(
+        "fetch",
+        vi
+          .fn()
+          .mockResolvedValue(
+            stubResponse({ body, ok: false, status: 402, statusText: "Payment Required" }),
+          ),
+      );
+
+      await expect(fetchClient("/api/llm/chats/chat-1/messages", {})).rejects.toThrow(body);
+    });
+
+    it("非 2xx 且正文为空时退回 HTTP error 文案", async () => {
+      const fetchClient = await renderActiveChat();
+      vi.stubGlobal(
+        "fetch",
+        vi
+          .fn()
+          .mockResolvedValue(
+            stubResponse({ body: "", ok: false, status: 502, statusText: "Bad Gateway" }),
+          ),
+      );
+
+      await expect(fetchClient("/api/llm/chats/chat-1/messages", {})).rejects.toThrow(
+        "HTTP error! status: 502",
+      );
+    });
+
+    it("2xx 响应原样返回", async () => {
+      const fetchClient = await renderActiveChat();
+      const okResponse = stubResponse({ body: "", ok: true, status: 200 });
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(okResponse));
+
+      await expect(fetchClient("/api/llm/chats/chat-1/messages", {})).resolves.toBe(okResponse);
+    });
+
+    it("onError 解开 StreamReadError 包装后 toast 响应正文", async () => {
+      renderChatPage();
+      fireEvent.click(await screen.findByRole("button", { name: "Trip planning" }));
+      await waitFor(() => expect(useChatState.current.onError).toBeTypeOf("function"));
+
+      const body = JSON.stringify({ code: 1001, message: "insufficient credits" });
+      // fetchClient 抛出的错误经 fetchEventSource 包成 StreamReadError。
+      const wrapped = Object.assign(new Error("Stream response body read failed"), {
+        cause: new Error(body),
+        name: "StreamReadError",
+      });
+      (useChatState.current.onError as (error: Error) => void)(wrapped);
+
+      expect(toastMocks.error).toHaveBeenCalledWith(body);
+    });
+
+    it("错误横幅同样展示解包后的响应正文", async () => {
+      const wrapped = Object.assign(new Error("Stream response body read failed"), {
+        cause: new Error("upstream provider unavailable"),
+        name: "StreamReadError",
+      });
+      useChatState.current = { ...useChatState.current, error: wrapped };
+
+      renderChatPage();
+      fireEvent.click(await screen.findByRole("button", { name: "Trip planning" }));
+
+      expect(await screen.findByRole("alert")).toBeTruthy();
+      expect(screen.getByText("upstream provider unavailable")).toBeTruthy();
+    });
   });
 });
